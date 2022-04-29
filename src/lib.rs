@@ -92,10 +92,10 @@ mod tests {
     use super::*;
 
     use rand::Rng;
+    use lazy_static::lazy_static;
     use std::{
         sync::{
             atomic::{AtomicPtr, Ordering},
-            Arc,
         },
         thread, time,
     };
@@ -106,27 +106,27 @@ mod tests {
 
         // Should probably wrap this in something nice that takes Box
         let rcu_ptr = AtomicPtr::default();
-        let domain = Arc::new(Domain::new());
+        lazy_static!{
+            static ref DOM: Domain = Domain::new();
+        };
 
-        let wd = domain.clone();
         let writer = thread::spawn(move || {
             for i in 0..10 {
                 thread::sleep(time::Duration::from_millis(10));
                 let new = Box::into_raw(Box::new(i as isize));
                 let old = rcu_ptr.swap(new, Ordering::SeqCst);
                 println!("Wrote new {:?}, retiring old {:?}", new, old);
-                wd.retire(old);
+                DOM.retire(old);
             }
         });
 
         // reader threads
         for i in 0..10 {
-            let rd = domain.clone();
             let handle = thread::spawn(move || {
                 for _ in 0..10 {
                     let mut rng = rand::thread_rng();
                     thread::sleep(time::Duration::from_millis(rng.gen_range(1..10)));
-                    let rl = rd.read_lock();
+                    let rl = DOM.read_lock();
                     let d = rcu_ptr.load(Ordering::Acquire);
                     println!("Reader {}: data {:?}", i, d);
                 }
