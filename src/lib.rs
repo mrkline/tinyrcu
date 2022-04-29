@@ -1,11 +1,11 @@
 use std::sync::{
-    atomic::{AtomicIsize, Ordering},
-    Arc, Mutex,
+    atomic::{AtomicIsize, AtomicPtr, Ordering},
+    Mutex,
 };
 
 /// A generation of RCU data that we're retiring as soon as its ref count hits 0
 struct Retiring {
-    refs: Arc<AtomicIsize>, // arc so that the domain and read locks can share
+    refs: Box<AtomicIsize>,
     deleter: Box<dyn Fn()>,
 }
 
@@ -21,60 +21,69 @@ impl Drop for Retiring {
 
 /// A read lock on a given RCU domain
 pub struct ReadLock {
-    // Instead of an arc, could we make this a pin, owned by the Domain?
-    // We're positive the Domain outlives ReadLocks on it (or they'd better!)
-    // Would save us bumping the ref count just to bump the ref count.
-    refs: Arc<AtomicIsize>,
+    refs: *const AtomicIsize,
 }
 
 impl ReadLock {
-    fn new(r: Arc<AtomicIsize>) -> Self {
-        r.fetch_add(1, Ordering::Relaxed);
+    fn new(r: *const AtomicIsize) -> Self {
+        unsafe {
+            (*r).fetch_add(1, Ordering::Relaxed);
+        }
         Self { refs: r }
     }
 }
 
 impl Drop for ReadLock {
     fn drop(&mut self) {
-        self.refs.fetch_sub(1, Ordering::AcqRel);
+        unsafe {
+            (*self.refs).fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
 /// An RCU garbage collector^W^W domain
 pub struct Domain {
-    refs: Arc<AtomicIsize>,
-    to_retire: Vec<Retiring>,
+    refs: AtomicPtr<AtomicIsize>,
+    to_retire: Mutex<Vec<Retiring>>,
 }
 
 impl Domain {
     pub fn new() -> Self {
         Self {
-            refs: Arc::new(AtomicIsize::new(0)),
-            to_retire: vec![],
+            refs: AtomicPtr::new(Box::into_raw(Box::new(AtomicIsize::new(0)))),
+            to_retire: Mutex::new(vec![]),
         }
     }
 
     pub fn read_lock(&self) -> ReadLock {
-        ReadLock::new(self.refs.clone())
+        let current_gen = self.refs.load(Ordering::Acquire);
+        assert!(!current_gen.is_null());
+        ReadLock::new(current_gen)
     }
 
     pub fn retire<T: 'static>(&self, p: *mut T) {
-        // We're retiring this generation.
-        let ret = Retiring {
-            refs: self.refs.clone(),
-            deleter: Box::new(move || unsafe {
-                Box::from_raw(p);
-            }),
-        };
+        let mut retirees = self.to_retire.lock().unwrap();
 
-        // Start a new generation
-        self.refs = Arc::new(AtomicIsize::new(0));
+        // We're retiring this generation.
+        let previous_generation = self.refs.swap(
+            Box::into_raw(Box::new(AtomicIsize::new(0))),
+            Ordering::SeqCst, // relaxed since we have a lock?
+        );
+        let ret = unsafe { Retiring {
+            refs: Box::from_raw(previous_generation),
+            deleter: Box::new(move || { Box::from_raw(p); })
+        }};
 
         // Add the retired generation to the list and delete all the ones
         // which don't have any references anymore.
-        self.to_retire.push(ret);
-        self.to_retire
-            .retain(|r| r.refs.load(Ordering::Acquire) > 0);
+        retirees.push(ret);
+        retirees.retain(|r| r.refs.load(Ordering::Acquire) > 0);
+    }
+}
+
+impl Drop for Domain {
+    fn drop(&mut self) {
+        unsafe { Box::from_raw(self.refs.load(Ordering::Relaxed)) };
     }
 }
 
