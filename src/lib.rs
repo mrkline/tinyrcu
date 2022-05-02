@@ -6,7 +6,7 @@ use std::sync::{
 /// A generation of RCU data that we're retiring as soon as its ref count hits 0
 struct Retiring {
     refs: Box<AtomicIsize>,
-    deleter: Box<dyn Fn()>,
+    _deleter: Box<dyn Send>,
 }
 
 impl Drop for Retiring {
@@ -15,7 +15,6 @@ impl Drop for Retiring {
             // Wait until nobody is referring to us.
             // < Gib futex >
         }
-        (self.deleter)();
     }
 }
 
@@ -47,21 +46,23 @@ pub struct Domain {
     to_retire: Mutex<Vec<Retiring>>,
 }
 
-impl Domain {
-    pub fn new() -> Self {
+impl Default for Domain {
+    fn default() -> Self {
         Self {
             refs: AtomicPtr::new(Box::into_raw(Box::new(AtomicIsize::new(0)))),
             to_retire: Mutex::new(vec![]),
         }
     }
+}
 
+impl Domain {
     pub fn read_lock(&self) -> ReadLock {
         let current_gen = self.refs.load(Ordering::Acquire);
         assert!(!current_gen.is_null());
         ReadLock::new(current_gen)
     }
 
-    pub fn retire<T: 'static>(&self, p: *mut T) {
+    pub unsafe fn retire<T: 'static + Send>(&self, p: *mut T) {
         let mut retirees = self.to_retire.lock().unwrap();
 
         // We're retiring this generation.
@@ -69,10 +70,13 @@ impl Domain {
             Box::into_raw(Box::new(AtomicIsize::new(0))),
             Ordering::SeqCst, // relaxed since we have a lock?
         );
-        let ret = unsafe { Retiring {
+
+        let deleter = Box::from_raw(p);
+
+        let ret = Retiring {
             refs: Box::from_raw(previous_generation),
-            deleter: Box::new(move || { Box::from_raw(p); })
-        }};
+            _deleter: deleter,
+        };
 
         // Add the retired generation to the list and delete all the ones
         // which don't have any references anymore.
@@ -91,12 +95,10 @@ impl Drop for Domain {
 mod tests {
     use super::*;
 
-    use rand::Rng;
     use lazy_static::lazy_static;
+    use rand::Rng;
     use std::{
-        sync::{
-            atomic::{AtomicPtr, Ordering},
-        },
+        sync::atomic::{AtomicPtr, Ordering},
         thread, time,
     };
 
@@ -105,18 +107,20 @@ mod tests {
         let mut handles = vec![];
 
         // Should probably wrap this in something nice that takes Box
-        let rcu_ptr = AtomicPtr::default();
-        lazy_static!{
-            static ref DOM: Domain = Domain::new();
+        lazy_static! {
+            static ref RCU_PTR: AtomicPtr<isize> = AtomicPtr::default();
+            static ref DOM: Domain = Domain::default();
         };
 
         let writer = thread::spawn(move || {
             for i in 0..10 {
-                thread::sleep(time::Duration::from_millis(10));
                 let new = Box::into_raw(Box::new(i as isize));
-                let old = rcu_ptr.swap(new, Ordering::SeqCst);
+                let old = RCU_PTR.swap(new, Ordering::SeqCst);
                 println!("Wrote new {:?}, retiring old {:?}", new, old);
-                DOM.retire(old);
+                unsafe {
+                    DOM.retire(old);
+                }
+                thread::sleep(time::Duration::from_millis(5));
             }
         });
 
@@ -126,9 +130,9 @@ mod tests {
                 for _ in 0..10 {
                     let mut rng = rand::thread_rng();
                     thread::sleep(time::Duration::from_millis(rng.gen_range(1..10)));
-                    let rl = DOM.read_lock();
-                    let d = rcu_ptr.load(Ordering::Acquire);
-                    println!("Reader {}: data {:?}", i, d);
+                    let _rl = DOM.read_lock();
+                    let d = RCU_PTR.load(Ordering::Acquire);
+                    println!("Reader {}: data {:?}", i, unsafe { d.as_ref() });
                 }
             });
             handles.push(handle);
